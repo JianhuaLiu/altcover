@@ -391,24 +391,26 @@ Target "Packaging" (fun _ ->
     ensureDirectory "./_Binaries/Packaging"
     ensureDirectory "./_Packaging"
 
-    let AltCover = FullName "_Binaries/AltCover/AltCover.exe"
-    let recorder = FullName "_Binaries/AltCover/Release+AnyCPU/AltCover.Recorder.dll"
+    let AltCoverMerged = FullName "_Binaries/AltCover/AltCover.exe"
+    let AltCover = if File.Exists AltCoverMerged then AltCoverMerged
+                   else findToolInSubPath "AltCover.exe" "./packages"
+    let AltCoverDir = Path.GetDirectoryName AltCover
+    let recorder = AltCoverDir @@ "AltCover.Recorder.dll"
     let packable = FullName "./_Binaries/README.html"
-    let resources = filesInDirMatchingRecursive "AltCover.resources.dll" (directoryInfo (FullName "_Binaries/AltCover/Release+AnyCPU"))
 
-    let applicationFiles = if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
-                            [
+    let resourceDir = if File.Exists AltCoverMerged then "_Binaries/AltCover/Release+AnyCPU"
+                      else AltCoverDir
+    let resources = filesInDirMatchingRecursive "AltCover.resources.dll" (directoryInfo (FullName resourceDir))
+
+    let applicationFiles =  [
                                 (AltCover, Some "tools/net45", None)
                                 (recorder, Some "tools/net45", None)
                                 (packable, Some "", None)
                             ]
-                           else []
-    let resourceFiles = if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
-                          resources
-                          |> Seq.map (fun x -> x.FullName)
-                          |> Seq.map (fun x -> (x, Some ("tools/net45/" + Path.GetFileName(Path.GetDirectoryName(x))), None))
-                          |> Seq.toList
-                        else []
+    let resourceFiles = resources
+                        |> Seq.map (fun x -> x.FullName)
+                        |> Seq.map (fun x -> (x, Some ("tools/net45/" + Path.GetFileName(Path.GetDirectoryName(x))), None))
+                        |> Seq.toList
 
     let root = (FullName ".").Length
     let netcoreFiles = [
@@ -488,13 +490,11 @@ Target "Unpack" (fun _ ->
 )
 
 Target "SimpleReleaseTest" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     let unpack = FullName "_Packaging/Unpack/tools/net45"
     Actions.SimpleInstrumentingRun "_Binaries/Sample1/Debug+AnyCPU" unpack "SimpleReleaseTest"
 )
 
 Target "SimpleMonoReleaseTest" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     let unpack = FullName "_Packaging/Unpack/tools/net45"
     Actions.SimpleInstrumentingRun "_Mono/Sample1" unpack "SimpleMonoReleaseTest"
 )
@@ -531,7 +531,6 @@ Target "ReleaseDotNetWithDotNet" (fun _ ->
 )
 
 Target "ReleaseDotNetWithFramework" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     ensureDirectory "./_Reports"
     let unpack = FullName "_Packaging/Unpack/tools/net45"
     let simpleReport = (FullName "./_Reports") @@ ( "ReleaseDotNetWithFramework.xml")
