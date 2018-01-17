@@ -51,6 +51,8 @@ module Instrument =
                          |> Seq.find (fun n -> n.EndsWith(".JSONFragments", StringComparison.Ordinal))
   let private resources = ResourceManager(resource , Assembly.GetExecutingAssembly())
   let version = typeof<AltCover.Recorder.Tracer>.Assembly.GetName().Version.ToString()
+
+  let monoRuntime = "Mono.Runtime" |> Type.GetType |> isNull |> not
 #if NETCOREAPP2_0
   let dependencies = (resources.GetString "netcoreDependencies").Replace("version",
                                                                           version)
@@ -178,23 +180,29 @@ module Instrument =
   /// when asked to strongname.  This writes a new .pdb/.mdb alongside the instrumented assembly</remark>
   let internal WriteAssembly (assembly:AssemblyDefinition) (path:string) =
     let pkey = Mono.Cecil.WriterParameters()
-#if NETSTANDARD2_0
-#else
 #if NETCOREAPP2_0
+    // Assembly with symbols pdb writing fails on .net core on Windows when writing with
+    // System.NullReferenceException : Object reference not set to an instance of an object.
+    // from deep inside Cecil -- but this works!!
+    pkey.WriteSymbols <- true
+    pkey.SymbolWriterProvider <- Mono.Cecil.Mdb.MdbWriterProvider() :> ISymbolWriterProvider
 #else
-    // Fails in .net core
-    pkey.SymbolWriterProvider <- match Path.GetExtension (Option.getOrElse String.Empty (ProgramDatabase.GetPdbWithFallback assembly)) with
-                                 | ".pdb" ->
-                                   pkey.WriteSymbols <- true
-                                   Mono.Cecil.Pdb.PdbWriterProvider() :> ISymbolWriterProvider
-                                 | _ ->
-                                   pkey.WriteSymbols <- false // TODO
-                                   null // Mono.Cecil.Mdb.MdbWriterProvider() :> ISymbolWriterProvider
 
-    // No strongnames in .net core
+    // Assembly with pdb writing fails on mono on Windows when writing with
+    // System.NullReferenceException : Object reference not set to an instance of an object.
+    // from deep inside Cecil
+    // Pdb writing fails on mono on non-Windows with
+    // System.DllNotFoundException : ole32.dll
+    //  at (wrapper managed-to-native) Mono.Cecil.Pdb.SymWriter:CoCreateInstance
+    // Mdb writing now fails in .net framework, it throws
+    // Mono.CompilerServices.SymbolWriter.MonoSymbolFileException :
+    // Exception of type 'Mono.CompilerServices.SymbolWriter.MonoSymbolFileException' was thrown.
+    pkey.WriteSymbols <- true
+    pkey.SymbolWriterProvider <- if monoRuntime then Mono.Cecil.Mdb.MdbWriterProvider() :> ISymbolWriterProvider else Mono.Cecil.Pdb.PdbWriterProvider() :> ISymbolWriterProvider
+
+    // Also, there are no strongnames in .net core
     KnownKey assembly.Name
     |> Option.iter (fun key -> pkey.StrongNameKeyPair <- key)
-#endif
 #endif
     assembly.Write(path, pkey)
 
@@ -263,8 +271,6 @@ module Instrument =
 
     // TODO -- is this still lookup table of any use??
     let assemblyReferenceSubstitutions = new Dictionary<String, String>()
-#if NETCOREAPP2_0
-#else
     let interestingReferences =  assembly.MainModule.AssemblyReferences
                                  |> Seq.cast<AssemblyNameReference>
                                  |> Seq.filter (fun x -> assemblies |> List.exists (fun y -> y.Equals(x.Name)))
@@ -272,11 +278,15 @@ module Instrument =
     interestingReferences
     |> Seq.iter (fun r -> let original = r.ToString()
                           let token = KnownToken r
-                          let effectiveKey = match token with
+                          let effectiveKey =
+#if NETCOREAPP2_0
+                                             None
+#else
+                                             match token with
                                              | None -> Visitor.defaultStrongNameKey
                                                        |> Option.map KeyStore.KeyToRecord
-                                             | key -> key
-
+                                             | Some _ -> token
+#endif
                           match effectiveKey with
                           | None -> r.HasPublicKey <- false
                                     r.PublicKeyToken <- null
@@ -288,7 +298,7 @@ module Instrument =
                           if  not <| updated.Equals(original, StringComparison.Ordinal) then
                             assemblyReferenceSubstitutions.[original] <- updated
                   )
-#endif
+
     assemblyReferenceSubstitutions
 
   let internal injectJSON json =
@@ -344,7 +354,7 @@ module Instrument =
                                            if included then
                                               assembly.MainModule.AssemblyReferences.Add(state.RecordingAssembly.Name)
                                            { state with RenameTable = updates } // TODO use this (attribute mappings IIRC)
-     | Module (m, _, included) -> //of ModuleDefinition * bool
+     | Module (m, _, included) ->
          let restate = match included with
                        | true ->
                          let recordingMethod = match state.RecordingMethod with
@@ -357,9 +367,9 @@ module Instrument =
                        | _ -> state
          { restate with ModuleId = m.Mvid }
 
-     | Type _ -> //of TypeDefinition * bool
+     | Type _ ->
          state
-     | Method (m, _,  included) -> //of MethodDefinition * bool
+     | Method (m, _,  included) ->
          match included with
          | true ->
            let body = m.Body
@@ -368,7 +378,7 @@ module Instrument =
               MethodWorker = body.GetILProcessor() }
          | _ -> state
 
-     | MethodPoint (instruction, _, point, included) -> //of Instruction * int * bool
+     | MethodPoint (instruction, _, point, included) ->
        if included then // by construction the sequence point is included
             let instrLoadModuleId = InsertVisit instruction state.MethodWorker state.RecordingMethodRef (state.ModuleId.ToString()) point
 
@@ -381,7 +391,7 @@ module Instrument =
             |> Seq.iter subs.SubstituteExceptionBoundary
 
        state
-     | AfterMethod included -> //of MethodDefinition * bool
+     | AfterMethod included ->
          if included then
             let body = state.MethodBody
             // changes conditional (br.s, brtrue.s ...) operators to corresponding "long" ones (br, brtrue)
@@ -391,7 +401,8 @@ module Instrument =
          state
 
      | AfterModule -> state
-     | AfterAssembly assembly -> let path = Path.Combine(Visitor.OutputDirectory(), assembly.MainModule.Name)
+     | AfterAssembly assembly -> let originalFileName = Path.GetFileName assembly.MainModule.FileName
+                                 let path = Path.Combine(Visitor.OutputDirectory(), originalFileName)
                                  WriteAssembly assembly path
                                  state
      | Finish -> let counterAssemblyFile = Path.Combine(Visitor.OutputDirectory(), (extractName state.RecordingAssembly) + ".dll")

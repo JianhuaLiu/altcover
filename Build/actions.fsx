@@ -9,24 +9,35 @@ open FSharp.Markdown
 open YamlDotNet.RepresentationModel
 
 module Actions =
-  let Clean ()  =
-    (DirectoryInfo ".").GetDirectories("*", SearchOption.AllDirectories)
-    |> Seq.filter (fun x -> x.Name.StartsWith "_" || x.Name = "bin" || x.Name = "obj")
-    |> Seq.map (fun x -> x.FullName)
-    |> Seq.distinct
-    // arrange so leaves get deleted first, avoiding "does not exist" warnings
-    |> Seq.groupBy (fun x -> x |> Seq.filter (fun c -> c='\\' || c = '/') |> Seq.length)
-    |> Seq.map (fun (n,x) -> (n, x |> Seq.sort))
-    |> Seq.sortBy (fun (n,x) -> -1 * n)
-    |> Seq.map (fun (n,x) -> x)
-    |> Seq.concat
-    |> Seq.iter (fun n -> printfn "Deleting %s" n
-                          Directory.Delete(n, true))
+  let Clean () =
+    let rec Clean1 depth =
+      try
+        (DirectoryInfo ".").GetDirectories("*", SearchOption.AllDirectories)
+        |> Seq.filter (fun x -> x.Name.StartsWith "_" || x.Name = "bin" || x.Name = "obj")
+        |> Seq.map (fun x -> x.FullName)
+        |> Seq.distinct
+        // arrange so leaves get deleted first, avoiding "does not exist" warnings
+        |> Seq.groupBy (fun x -> x |> Seq.filter (fun c -> c='\\' || c = '/') |> Seq.length)
+        |> Seq.map (fun (n,x) -> (n, x |> Seq.sort))
+        |> Seq.sortBy (fun (n,x) -> -1 * n)
+        |> Seq.map (fun (n,x) -> x)
+        |> Seq.concat
+        |> Seq.iter (fun n -> printfn "Deleting %s" n
+                              Directory.Delete(n, true))
 
-    let temp = Environment.GetEnvironmentVariable("TEMP")
-    if not <| String.IsNullOrWhiteSpace temp then
-      Directory.GetFiles(temp, "*.tmp.dll.mdb")
-      |> Seq.iter File.Delete
+        let temp = Environment.GetEnvironmentVariable("TEMP")
+        if not <| String.IsNullOrWhiteSpace temp then
+            Directory.GetFiles(temp, "*.tmp.dll.mdb")
+            |> Seq.iter File.Delete
+       with
+       | :? System.IO.IOException as x -> Clean' (x :> Exception) depth
+       | :? System.UnauthorizedAccessException as x -> Clean' (x :> Exception) depth
+    and Clean' x depth =
+      printfn "looping after %A" x
+      System.Threading.Thread.Sleep(500)
+      if depth < 10 then Clean1 (depth + 1)
+
+    Clean1 0
 
   let template ="""namespace AltCover
 open System.Reflection
@@ -100,12 +111,13 @@ open System.Runtime.CompilerServices
                           mvid |> Array.iteri (fun i x -> symbols.[i+16] <- x)
                           System.IO.File.WriteAllBytes(f + ".mdb", symbols))
 
-  let ValidateFSharpTypes simpleReport =
+  let ValidateFSharpTypes simpleReport others =
     use coverageFile = new FileStream(simpleReport, FileMode.Open, FileAccess.Read, FileShare.None, 4096, FileOptions.SequentialScan)
     // Edit xml report to store new hits
     let coverageDocument = XDocument.Load(XmlReader.Create(coverageFile))
     let recorded = coverageDocument.Descendants(XName.Get("method"))
                    |> Seq.map (fun x -> x.Attribute(XName.Get("name")).Value)
+                   |> Seq.filter (fun x -> others |> Seq.exists (fun y -> x = y) |> not)
                    |> Seq.sort
                    |> Seq.toList
     let expected = "Invoke as_bar bytes get_MyBar makeThing returnBar returnFoo testMakeThing testMakeUnion"
@@ -147,13 +159,34 @@ open System.Runtime.CompilerServices
     let instrumented = "__Instrumented." + reportSigil
     let result = ExecProcess (fun info -> info.FileName <- binRoot @@ "AltCover.exe"
                                           info.WorkingDirectory <- sampleRoot
-                                          info.Arguments <- ("-t=System. -x=" + simpleReport + " /o=./" + instrumented)) (TimeSpan.FromMinutes 5.0)
+                                          info.Arguments <- ("\"-t=System\\.\" -x=" + simpleReport + " /o=./" + instrumented)) (TimeSpan.FromMinutes 5.0)
     if result <> 0 then failwith "Simple instrumentation failed"
     let result2 = ExecProcess (fun info -> info.FileName <- sampleRoot @@ (instrumented + "/Sample1.exe")
                                            info.WorkingDirectory <- (sampleRoot @@ instrumented)
                                            info.Arguments <- "") (TimeSpan.FromMinutes 5.0)
     if result2 <> 0 then failwith "Instrumented .exe failed"
     ValidateSample1 simpleReport reportSigil
+
+  let SimpleInstrumentingRunUnderMono (samplePath:string) (binaryPath:string) (reportSigil':string) (monoOnWindows:string option)=
+   printfn "Instrument and run a simple executable under mono"
+   match monoOnWindows with
+   | Some mono ->
+    ensureDirectory "./_Reports"
+    let reportSigil = reportSigil' + "UnderMono"
+    let simpleReport = (FullName "./_Reports") @@ ( reportSigil + ".xml")
+    let binRoot = FullName binaryPath
+    let sampleRoot = FullName samplePath
+    let instrumented = "__Instrumented." + reportSigil
+    let result = ExecProcess (fun info -> info.FileName <- mono
+                                          info.WorkingDirectory <- sampleRoot
+                                          info.Arguments <- ((binRoot @@ "AltCover.exe") + " \"-t=System\\.\" -x=" + simpleReport + " /o=./" + instrumented)) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwith "Simple instrumentation failed"
+    let result2 = ExecProcess (fun info -> info.FileName <- sampleRoot @@ (instrumented + "/Sample1.exe")
+                                           info.WorkingDirectory <- (sampleRoot @@ instrumented)
+                                           info.Arguments <- "") (TimeSpan.FromMinutes 5.0)
+    if result2 <> 0 then failwith "Instrumented .exe failed"
+    ValidateSample1 simpleReport reportSigil
+   | None -> failwith "Mono executable expected"
 
 let PrepareReadMe packingCopyright =
     let readme = FullName "README.md"

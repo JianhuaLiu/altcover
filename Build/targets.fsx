@@ -16,7 +16,22 @@ let Copyright  = ref String.Empty
 let Version = ref String.Empty
 
 let OpenCoverFilter = "+[AltCove*]* -[*]Microsoft.* -[*]System.* +[*]N.*"
-let AltCoverFilter= @" -s=Mono -s=\.Recorder -s=Sample -s=nunit -t=Tests -t=System. -t=Sample3\.Class2 "
+let AltCoverFilter= @" -s=Mono -s=\.Recorder -s=Sample -s=nunit -e=Tests -t=System. -t=Sample3\.Class2 "
+let AltCoverFilterG= @" -s=Mono -s=\.Recorder\.g -s=Sample -s=nunit -e=Tests -t=System. -t=Sample3\.Class2 "
+
+// A more accurate flag for what is going on in travis-ci
+let runningInMono = "Mono.Runtime" |> Type.GetType |> isNull |> not
+
+let programFiles = environVar "ProgramFiles"
+let programFiles86 = "ProgramFiles(x86) "
+
+let monoOnWindows = if Environment.OSVersion.VersionString.StartsWith("Microsoft Windows") then
+                       [programFiles; programFiles86]
+                       |> List.filter (String.IsNullOrWhiteSpace >> not)
+                       |> List.map (fun s -> s @@ "Mono/bin/mono.exe")
+                       |> List.filter File.Exists
+                       |> List.tryFind (fun _ -> true)
+                    else None
 
 // Preparation
 
@@ -109,7 +124,6 @@ Target "Lint" (fun _ ->
         |> Seq.iter (FSharpLint (fun options -> { options with FailBuildIfAnyWarnings = true }) ))
 
 Target "Gendarme" (fun _ -> // Needs debug because release is compiled --standalone which contaminates everything
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     ensureDirectory "./_Reports"
 
     let r = ExecProcess (fun info -> info.FileName <- (findToolInSubPath "gendarme.exe" "./packages")
@@ -130,7 +144,6 @@ Target "Gendarme" (fun _ -> // Needs debug because release is compiled --standal
 *)
 
 Target "FxCop" (fun _ -> // Needs debug because release is compiled --standalone which contaminates everything
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     ensureDirectory "./_Reports"
     let fxCop = combinePaths (environVar "VS150COMNTOOLS") "../../Team Tools/Static Analysis Tools/FxCop/FxCopCmd.exe"
     let rules = ["-Microsoft.Design#CA1004"
@@ -168,16 +181,18 @@ Target "FxCop" (fun _ -> // Needs debug because release is compiled --standalone
 // Unit Test
 
 Target "UnitTest" (fun _ ->
-  !! (@"_Reports/*/Summary.xml")
-  |> Seq.iter (fun f -> let xml = XDocument.Load f
-                        xml.Descendants(XName.Get("Linecoverage"))
-                        |> Seq.iter (fun e -> let coverage = e.Value.Replace("%", String.Empty)
-                                              match Double.TryParse coverage with
-                                              | (false, _) -> failwith ("Could not parse coverage "+coverage)
-                                              | (_, numeric) -> printfn "%s : %A" (f |> Path.GetDirectoryName |> Path.GetFileName) numeric
-                                                                if numeric < 90.0 then failwith "Coverage is too low"
-                        )
-  )
+  let numbers = !! (@"_Reports/*/Summary.xml")
+                |> Seq.collect (fun f -> let xml = XDocument.Load f
+                                         xml.Descendants(XName.Get("Linecoverage"))
+                                         |> Seq.map (fun e -> let coverage = e.Value.Replace("%", String.Empty)
+                                                              match Double.TryParse coverage with
+                                                              | (false, _) -> failwith ("Could not parse coverage "+coverage)
+                                                              | (_, numeric) -> printfn "%s : %A" (f |> Path.GetDirectoryName |> Path.GetFileName) numeric
+                                                                                numeric))
+                |> Seq.toList
+
+  if numbers |> List.tryFind (fun n -> n >= 90.0) |> Option.isNone && numbers |> List.length > 1 then
+     failwith "Coverage is too low"
 )
 
 Target "JustUnitTest" (fun _ ->
@@ -200,7 +215,6 @@ Target "UnitTestDotNet" (fun _ ->
 )
 
 Target "UnitTestWithOpenCover" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     ensureDirectory "./_Reports/_UnitTestWithOpenCover"
     let testFiles = !! (@"_Binaries/*Tests/Debug+AnyCPU/*.Test*.dll")
                     //|> Seq.map (fun f -> f.FullName)
@@ -231,44 +245,90 @@ Target "UnitTestWithOpenCover" (fun _ ->
 // Hybrid (Self) Tests
 
 Target "UnitTestWithAltCover" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then // Mono + F# + Fake build => no symbols
     ensureDirectory "./_Reports/_UnitTestWithAltCover"
     let keyfile = FullName "Build/SelfTest.snk"
     let reports = FullName "./_Reports"
     let altcover = findToolInSubPath "AltCover.exe" "./_Binaries"
 
-    let altReport = reports @@ "UnitTestWithAltCover.xml"
+    let testDirectory = FullName "_Binaries/AltCover.Tests/Debug+AnyCPU"
+    if !! (testDirectory @@ "AltCov*.pdb") |> Seq.length > 0 then
+
+      let altReport = reports @@ "UnitTestWithAltCover.xml"
+      printfn "Instrumented the code"
+      let result = ExecProcess (fun info -> info.FileName <- altcover
+                                            info.WorkingDirectory <- testDirectory
+                                            info.Arguments <- ("/sn=" + keyfile + AltCoverFilter + @"/o=./__UnitTestWithAltCover -x=" + altReport)) (TimeSpan.FromMinutes 5.0)
+      if result <> 0 then failwithf "Re-instrument returned with a non-zero exit code"
+
+      printfn "Unit test the instrumented code"
+      [ !! "_Binaries/AltCover.Tests/Debug+AnyCPU/__UnitTestWithAltCover/*.Tests.dll"
+        !! "_Binaries/AltCover.Tests/Debug+AnyCPU/__UnitTestWithAltCover/*ple2.dll"]
+      |> Seq.concat |> Seq.distinct
+      |> NUnit3 (fun p -> { p with ToolPath = findToolInSubPath "nunit3-console.exe" "."
+                                   WorkingDir = "."
+                                   ResultSpecs = ["./_Reports/UnitTestWithAltCoverReport.xml"] })
+
+      printfn "Instrument the shadow tests"
+      let shadowDir = FullName  "_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU"
+      let shadowReport = reports @@ "ShadowTestWithAltCover.xml"
+      let result = ExecProcess (fun info -> info.FileName <- altcover
+                                            info.WorkingDirectory <- shadowDir
+                                            info.Arguments <- ("/sn=" + keyfile + AltCoverFilter + @"/o=./__ShadowTestWithAltCover -x=" + shadowReport)) (TimeSpan.FromMinutes 5.0)
+
+      printfn "Execute the shadow tests"
+      !! ("_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU/__ShadowTestWithAltCover/*.Test*.dll")
+      |> NUnit3 (fun p -> { p with ToolPath = findToolInSubPath "nunit3-console.exe" "."
+                                   WorkingDir = "."
+                                   ResultSpecs = ["./_Reports/ShadowTestWithAltCoverReport.xml"] })
+
+      ReportGenerator (fun p -> { p with ExePath = findToolInSubPath "ReportGenerator.exe" "."
+                                         ReportTypes = [ ReportGeneratorReportType.Html; ReportGeneratorReportType.Badges; ReportGeneratorReportType.XmlSummary ]
+                                         TargetDir = "_Reports/_UnitTestWithAltCover"})
+          [altReport; shadowReport]
+    else
+      printfn "Symbols not present; skipping"
+)
+
+Target "UnitTestWithAltCoverCore" (fun _ ->
+    ensureDirectory "./_Reports/_UnitTestWithAltCover"
+    let keyfile = FullName "Build/SelfTest.snk"
+    let reports = FullName "./_Reports"
+    let altcover = findToolInSubPath "AltCover.exe" "./_Binaries"
+
+    let testDirectory = FullName "_Binaries/AltCover.Tests/Debug+AnyCPU/netcoreapp2.0"
+    let output = FullName "Tests/_Binaries/AltCover.Tests/Debug+AnyCPU/netcoreapp2.0"
+
+    let altReport = reports @@ "UnitTestWithAltCoverCore.xml"
     printfn "Instrumented the code"
     let result = ExecProcess (fun info -> info.FileName <- altcover
-                                          info.WorkingDirectory <- FullName "_Binaries/AltCover.Tests/Debug+AnyCPU"
-                                          info.Arguments <- ("/sn=" + keyfile + AltCoverFilter + @"/o=./__UnitTestWithAltCover -x=" + altReport)) (TimeSpan.FromMinutes 5.0)
-    if result <> 0 then failwithf "Re-instrument returned with a non-zero exit code"
+                                          info.WorkingDirectory <- testDirectory
+                                          info.Arguments <- ("/sn=" + keyfile + AltCoverFilter + @"/o=" + output + " -x=" + altReport)) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwithf "first instrument returned with a non-zero exit code"
 
     printfn "Unit test the instrumented code"
-    [ !! "_Binaries/AltCover.Tests/Debug+AnyCPU/__UnitTestWithAltCover/*.Tests.dll"
-      !! "_Binaries/AltCover.Tests/Debug+AnyCPU/__UnitTestWithAltCover/*ple2.dll"]
-    |> Seq.concat |> Seq.distinct
-    |> NUnit3 (fun p -> { p with ToolPath = findToolInSubPath "nunit3-console.exe" "."
-                                 WorkingDir = "."
-                                 ResultSpecs = ["./_Reports/UnitTestWithAltCoverReport.xml"] })
+    let result = ExecProcess (fun info -> info.FileName <- "dotnet"
+                                          info.WorkingDirectory <- FullName "Tests"
+                                          info.Arguments <- ("test --no-build --configuration Debug altcover.tests.core.fsproj")) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwithf "first test returned with a non-zero exit code"
 
     printfn "Instrument the shadow tests"
-    let shadowDir = "_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU"
-    let shadowReport = reports @@ "ShadowTestWithAltCover.xml"
+    let shadowDir = "_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU/netcoreapp2.0"
+    let shadowReport = reports @@ "ShadowTestWithAltCoverCore.xml"
+    let shadowOut = FullName "Shadow.Tests/_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU/netcoreapp2.0"
     let result = ExecProcess (fun info -> info.FileName <- altcover
-                                          info.WorkingDirectory <- FullName "_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU"
-                                          info.Arguments <- ("/sn=" + keyfile + AltCoverFilter + @"/o=./__ShadowTestWithAltCover -x=" + shadowReport)) (TimeSpan.FromMinutes 5.0)
-
+                                          info.WorkingDirectory <- shadowDir
+                                          info.Arguments <- ("/sn=" + keyfile + AltCoverFilterG + @"/o=" + shadowOut + " -x=" + shadowReport)) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwithf "second instrument returned with a non-zero exit code"
     printfn "Execute the shadow tests"
-    !! ("_Binaries/AltCover.Shadow.Tests/Debug+AnyCPU/__ShadowTestWithAltCover/*.Test*.dll")
-    |> NUnit3 (fun p -> { p with ToolPath = findToolInSubPath "nunit3-console.exe" "."
-                                 WorkingDir = "."
-                                 ResultSpecs = ["./_Reports/ShadowTestWithAltCoverReport.xml"] })
+    let result = ExecProcess (fun info -> info.FileName <- "dotnet"
+                                          info.WorkingDirectory <- FullName "Shadow.Tests"
+                                          info.Arguments <- ("test --no-build --configuration Debug altcover.recorder.tests.core.fsproj")) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwithf "second test returned with a non-zero exit code"
 
     ReportGenerator (fun p -> { p with ExePath = findToolInSubPath "ReportGenerator.exe" "."
-                                       ReportTypes = [ ReportGeneratorReportType.Html; ReportGeneratorReportType.Badges; ReportGeneratorReportType.XmlSummary ]
-                                       TargetDir = "_Reports/_UnitTestWithAltCover"})
-        [altReport; shadowReport]
+                                       ReportTypes = [ ReportGeneratorReportType.Html; ReportGeneratorReportType.Badges; ReportGeneratorReportType.XmlSummary]
+                                       TargetDir = "_Reports/_UnitTestWithAltCoverCore"})
+          [altReport; shadowReport]
 )
 
 // Pure OperationalTests
@@ -276,28 +336,37 @@ Target "UnitTestWithAltCover" (fun _ ->
 Target "OperationalTest" ignore
 
 Target "FSharpTypes" ( fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then // Mono + F# + Fake build => no symbols
     ensureDirectory "./_Reports"
     let simpleReport = (FullName "./_Reports") @@ ( "AltCoverFSharpTypes.xml")
     let binRoot = FullName "_Binaries/AltCover/Release+AnyCPU"
     let sampleRoot = FullName "_Binaries/Sample2/Debug+AnyCPU"
     let instrumented = "__FSharpTypes"
-    let result = ExecProcess (fun info -> info.FileName <- binRoot @@ "AltCover.exe"
-                                          info.WorkingDirectory <- sampleRoot
-                                          info.Arguments <- ("-t=System\. -t=Microsoft\. -x=" + simpleReport + " /o=./" + instrumented)) (TimeSpan.FromMinutes 5.0)
-    Actions.ValidateFSharpTypes simpleReport
+
+    if sampleRoot @@ "Sample2.pdb" |> File.Exists then
+      let result = ExecProcess (fun info -> info.FileName <- binRoot @@ "AltCover.exe"
+                                            info.WorkingDirectory <- sampleRoot
+                                            info.Arguments <- ("-t=System\. -t=Microsoft\. -x=" + simpleReport + " /o=./" + instrumented)) (TimeSpan.FromMinutes 5.0)
+      Actions.ValidateFSharpTypes simpleReport []
+    else
+      printfn "Symbols not present; skipping"
 )
 
 Target "FSharpTypesDotNet" ( fun _ ->
     ensureDirectory "./_Reports"
     let project = FullName "./AltCover/altcover.core.fsproj"
     let simpleReport = (FullName "./_Reports") @@ ( "AltCoverFSharpTypesDotNet.xml")
-    let sampleRoot = FullName "_Binaries/Sample2/Release+AnyCPU/netstandard2.0"
-    let instrumented = "__FSharpTypesDotNet"
+    let sampleRoot = FullName "_Binaries/Sample2/Debug+AnyCPU/netcoreapp2.0"
+    let instrumented = FullName "Sample2/_Binaries/Sample2/Debug+AnyCPU/netcoreapp2.0"
     DotNetCli.RunCommand (fun p -> {p with WorkingDir = sampleRoot})
-                         ("run --project " + project + " -- -t \"System\\.\" -t \"Microsoft\\.\" -x \"" + simpleReport + "\" /o \"./" + instrumented + "\"")
+                         ("run --project " + project + " -- -t \"System\\.\" -t \"Microsoft\\.\" -x \"" + simpleReport + "\" /o \"" + instrumented + "\"")
 
-    Actions.ValidateFSharpTypes simpleReport
+    Actions.ValidateFSharpTypes simpleReport ["main"]
+
+    printfn "Execute the instrumented tests"
+    let result = ExecProcess (fun info -> info.FileName <- "dotnet"
+                                          info.WorkingDirectory <- FullName "Sample2"
+                                          info.Arguments <- ("test --no-build --configuration Debug sample2.core.fsproj")) (TimeSpan.FromMinutes 5.0)
+    if result <> 0 then failwithf "sample test returned with a non-zero exit code"
 )
 
 Target "BasicCSharp" (fun _ ->
@@ -306,6 +375,16 @@ Target "BasicCSharp" (fun _ ->
 
 Target "BasicCSharpMono" (fun _ ->
     Actions.SimpleInstrumentingRun "_Mono/Sample1" "_Binaries/AltCover/Debug+AnyCPU" "BasicCSharpMono"
+)
+
+Target "BasicCSharpUnderMono" (fun _ ->
+    monoOnWindows |>
+    Actions.SimpleInstrumentingRunUnderMono "_Binaries/Sample1/Debug+AnyCPU" "_Binaries/AltCover/Debug+AnyCPU" "BasicCSharp"
+)
+
+Target "BasicCSharpMonoUnderMono" (fun _ ->
+    monoOnWindows |>
+    Actions.SimpleInstrumentingRunUnderMono "_Mono/Sample1" "_Binaries/AltCover/Debug+AnyCPU" "BasicCSharpMono"
 )
 
 Target "CSharpMonoWithDotNet" (fun _ ->
@@ -351,7 +430,6 @@ Target "CSharpDotNetWithFramework" (fun _ ->
 )
 
 Target "SelfTest" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then
     ensureDirectory "./_Reports/_Instrumented"
     let targetDir = "_Binaries/AltCover.Tests/Debug+AnyCPU"
     let reports = FullName "./_Reports"
@@ -429,6 +507,7 @@ Target "Packaging" (fun _ ->
                        |> List.concat
                        |> List.map (fun x -> (x, Some ("tools/netcoreapp2.0" + Path.GetDirectoryName(x).Substring(root).Replace("\\","/")), None))
 
+    printfn "Executing on %A" Environment.OSVersion
     NuGet (fun p ->
     {p with
         Authors = ["Steve Gilham"]
@@ -448,7 +527,6 @@ Target "Packaging" (fun _ ->
 )
 
 Target "PrepareFrameworkBuild" (fun _ ->
-  if String.IsNullOrWhiteSpace(environVar "TRAVIS_JOB_NUMBER") then // ILMerge yields The type initializer for 'System.Compiler.CoreSystemTypes' threw an exception.
     let toolpath = findToolInSubPath "ILMerge.exe" "./packages"
     let here = Directory.GetCurrentDirectory()
 
@@ -491,12 +569,16 @@ Target "Unpack" (fun _ ->
 
 Target "SimpleReleaseTest" (fun _ ->
     let unpack = FullName "_Packaging/Unpack/tools/net45"
-    Actions.SimpleInstrumentingRun "_Binaries/Sample1/Debug+AnyCPU" unpack "SimpleReleaseTest"
+    if (unpack @@ "AltCover.exe") |> File.Exists then
+      Actions.SimpleInstrumentingRun "_Binaries/Sample1/Debug+AnyCPU" unpack "SimpleReleaseTest"
+    else printfn "Skipping -- AltCover.exe not packaged"
 )
 
 Target "SimpleMonoReleaseTest" (fun _ ->
     let unpack = FullName "_Packaging/Unpack/tools/net45"
-    Actions.SimpleInstrumentingRun "_Mono/Sample1" unpack "SimpleMonoReleaseTest"
+    if (unpack @@ "AltCover.exe") |> File.Exists then
+      Actions.SimpleInstrumentingRun "_Mono/Sample1" unpack "SimpleMonoReleaseTest"
+    else printfn "Skipping -- AltCover.exe not packaged"
 )
 
 Target "ReleaseMonoWithDotNet" (fun _ ->
@@ -533,16 +615,18 @@ Target "ReleaseDotNetWithDotNet" (fun _ ->
 Target "ReleaseDotNetWithFramework" (fun _ ->
     ensureDirectory "./_Reports"
     let unpack = FullName "_Packaging/Unpack/tools/net45"
-    let simpleReport = (FullName "./_Reports") @@ ( "ReleaseDotNetWithFramework.xml")
-    let sampleRoot = FullName "./_Binaries/Sample1/Debug+AnyCPU/netcoreapp2.0"
-    let instrumented = sampleRoot @@ "__Instrumented.ReleaseDotNetWithFramework"
-    let result = ExecProcess (fun info -> info.FileName <- unpack @@ "AltCover.exe"
-                                          info.WorkingDirectory <- sampleRoot
-                                          info.Arguments <- ("-t=System\. -t=Microsoft\. -x=" + simpleReport + " /o=" + instrumented)) (TimeSpan.FromMinutes 5.0)
+    if (unpack @@ "AltCover.exe") |> File.Exists then
+      let simpleReport = (FullName "./_Reports") @@ ( "ReleaseDotNetWithFramework.xml")
+      let sampleRoot = FullName "./_Binaries/Sample1/Debug+AnyCPU/netcoreapp2.0"
+      let instrumented = sampleRoot @@ "__Instrumented.ReleaseDotNetWithFramework"
+      let result = ExecProcess (fun info -> info.FileName <- unpack @@ "AltCover.exe"
+                                            info.WorkingDirectory <- sampleRoot
+                                            info.Arguments <- ("-t=System\. -t=Microsoft\. -x=" + simpleReport + " /o=" + instrumented)) (TimeSpan.FromMinutes 5.0)
 
-    DotNetCli.RunCommand (fun info -> { info with WorkingDir = instrumented }) "Sample1.dll"
+      DotNetCli.RunCommand (fun info -> { info with WorkingDir = instrumented }) "Sample1.dll"
 
-    Actions.ValidateSample1 "./_Reports/ReleaseDotNetWithFramework.xml" "ReleaseDotNetWithFramework"
+      Actions.ValidateSample1 "./_Reports/ReleaseDotNetWithFramework.xml" "ReleaseDotNetWithFramework"
+    else printfn "Skipping -- AltCover.exe not packaged"
 )
 
 // AOB
@@ -583,12 +667,18 @@ Target "All" ignore
 ==> "Analysis"
 
 "Compilation"
+?=> "Analysis"
+
+"Compilation"
 ==> "FxCop"
-==> "Analysis"
+=?> ("Analysis", not runningInMono) // not supported
 
 "Compilation"
 ==> "Gendarme"
-==> "Analysis"
+=?> ("Analysis", not runningInMono) // TODO -- refactor
+
+"Compilation"
+?=> "UnitTest"
 
 "Compilation"
 ==> "JustUnitTest"
@@ -600,11 +690,18 @@ Target "All" ignore
 
 "Compilation"
 ==> "UnitTestWithOpenCover"
-==> "UnitTest"
+=?> ("UnitTest", not runningInMono)  // OpenCover Mono support
 
 "Compilation"
 ==> "UnitTestWithAltCover"
 ==> "UnitTest"
+
+"UnitTestDotNet"
+==> "UnitTestWithAltCoverCore"
+==> "UnitTest"
+
+"Compilation"
+?=> "OperationalTest"
 
 "Compilation"
 ==> "FSharpTypes"
@@ -623,6 +720,14 @@ Target "All" ignore
 ==> "OperationalTest"
 
 "Compilation"
+==> "BasicCSharpUnderMono"
+=?> ("OperationalTest", Option.isSome monoOnWindows)
+
+"Compilation"
+==> "BasicCSharpMonoUnderMono"
+=?> ("OperationalTest", Option.isSome monoOnWindows)
+
+"Compilation"
 ==> "CSharpMonoWithDotNet"
 ==> "OperationalTest"
 
@@ -636,11 +741,14 @@ Target "All" ignore
 
 "Compilation"
 ==> "SelfTest"
-==> "OperationalTest"
+=?> ("OperationalTest", not runningInMono)  // OpenCover Mono support AND Mono + F# + Fake build => no symbols
+
+"Compilation"
+?=> "Packaging"
 
 "Compilation"
 ==> "PrepareFrameworkBuild"
-==> "Packaging"
+=?> ("Packaging", not runningInMono)  // can't ILMerge
 
 "Compilation"
 ==> "PrepareDotNetBuild"
@@ -652,6 +760,9 @@ Target "All" ignore
 
 "Packaging"
 ==> "Unpack"
+
+"Compilation"
+?=> "Deployment"
 
 "Unpack"
 ==> "SimpleReleaseTest"
@@ -665,10 +776,7 @@ Target "All" ignore
 ==> "ReleaseMonoWithDotNet"
 ==> "Deployment"
 
-// Unhandled Exception: System.IO.FileNotFoundException: Could not load file or assembly
-// 'FSharp.Core, Version=4.4.1.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'. The system cannot find the file specified.
 "Unpack"
-//
 ==> "ReleaseDotNetWithDotNet"
 ==> "Deployment"
 
@@ -688,15 +796,5 @@ Target "All" ignore
 "Deployment"
 ==> "BulkReport"
 ==> "All"
-
-(*
-// Debug chain
-"SetVersion"
-=?> ("BuildDebug", (not(File.Exists("./_Generated/AssemblyVersion.fs"))))
-"SetVersion"
-?=> "BuildDebug"
-"Clean"
-?=> "BuildDebug"
-*)
 
 RunTargetOrDefault "All"
