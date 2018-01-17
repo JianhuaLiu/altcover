@@ -473,7 +473,8 @@ Target "Packaging" (fun _ ->
     let AltCover = if File.Exists AltCoverMerged then AltCoverMerged
                    else findToolInSubPath "AltCover.exe" "./packages"
     let AltCoverDir = Path.GetDirectoryName AltCover
-    let recorder = AltCoverDir @@ "AltCover.Recorder.dll"
+    let recorder = if File.Exists AltCoverMerged then AltCoverDir @@ "Release+AnyCPU/AltCover.Recorder.dll"
+                   else AltCoverDir @@ "AltCover.Recorder.dll"
     let packable = FullName "./_Binaries/README.html"
 
     let resourceDir = if File.Exists AltCoverMerged then "_Binaries/AltCover/Release+AnyCPU"
