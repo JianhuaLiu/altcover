@@ -15,8 +15,7 @@
     <TargetFSharpCoreVersion>4.4.1.0</TargetFSharpCoreVersion>
     <MinimumVisualStudioVersion Condition="'$(MinimumVisualStudioVersion)' == ''">11</MinimumVisualStudioVersion>
     <TargetFrameworkProfile />
-    <NuGetPackageImportStamp>
-    </NuGetPackageImportStamp>
+    <UseStandardResourceNames>True</UseStandardResourceNames>
     <ResolveNuGetPackages>false</ResolveNuGetPackages>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -78,8 +77,8 @@
     <Compile Include="..\AltCover\CommandLine.fs">
       <Link>CommandLine.fs</Link>
     </Compile>
-    <Compile Include="..\AltCover.Recorder\Recorder.fs">
-      <Link>Recorder.fs</Link>
+    <Compile Include="..\AltCover.Recorder\Base.fs">
+      <Link>Base.fs</Link>
     </Compile>
     <Compile Include="Runner.fs" />
     <EmbeddedResource Include="Strings.resx" />
@@ -87,6 +86,18 @@
     <Content Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <Reference Include="Mono.Cecil">
+      <HintPath>..\packages\Mono.Cecil.0.10.0-beta7\lib\net40\Mono.Cecil.dll</HintPath>
+    </Reference>
+    <Reference Include="Mono.Cecil.Mdb">
+      <HintPath>..\packages\Mono.Cecil.0.10.0-beta7\lib\net40\Mono.Cecil.Mdb.dll</HintPath>
+    </Reference>
+    <Reference Include="Mono.Cecil.Pdb">
+      <HintPath>..\packages\Mono.Cecil.0.10.0-beta7\lib\net40\Mono.Cecil.Pdb.dll</HintPath>
+    </Reference>
+    <Reference Include="Mono.Cecil.Rocks">
+      <HintPath>..\packages\Mono.Cecil.0.10.0-beta7\lib\net40\Mono.Cecil.Rocks.dll</HintPath>
+    </Reference>
     <Reference Include="Mono.Options">
       <HintPath>..\packages\Mono.Options.Signed.0.2.3\lib\net45\Mono.Options.dll</HintPath>
     </Reference>

@@ -3,11 +3,12 @@
 open System
 open System.Collections.Generic
 open System.IO
-open System.Reflection
 
+open Mono.Cecil
 open Mono.Options
 open Augment
 
+[<System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage>]
 type Tracer = { Tracer : string }
 
 module Runner =
@@ -71,10 +72,53 @@ module Runner =
                  parse
     | fail -> fail
 
-  // Assembly.LoadFrom is "problematic", but necessary so I can read the report file path
-  // and ReflectionOnly context is not supported in .net core  cecil it, maybe??
-  [<System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Reliability",
-                                                    "CA2001")>]
+  // mocking point
+  let mutable internal RecorderName = "AltCover.Recorder.g.dll"
+
+  let RecorderInstance () =
+    let recorderPath = Path.Combine (Option.get recordingDirectory, RecorderName)
+    let definition = AssemblyDefinition.ReadAssembly recorderPath
+    definition.MainModule.GetType("AltCover.Recorder.Instance")
+
+  let GetMethod (t:TypeDefinition) (name:string) =
+    t.Methods
+    |> Seq.filter (fun m -> m.Name = name)
+    |> Seq.head
+
+  let GetFirstOperandAsString (m:MethodDefinition) =
+     m.Body.Instructions.[0].Operand :?> string
+
+  let PayloadBase (rest:string list) =
+    async {
+            CommandLine.doPathOperation (fun () ->
+                CommandLine.ProcessTrailingArguments rest (DirectoryInfo(Option.get workingDirectory)))
+          }
+
+  let MonitorBase (hits:ICollection<(string*int)>) token =
+    async {
+      use server = new System.IO.Pipes.NamedPipeServerStream(token)
+      let formatter = System.Runtime.Serialization.Formatters.Binary.BinaryFormatter()
+      server.WaitForConnection()
+      server.WriteByte(0uy)
+      let rec sink () =
+        let result = formatter.Deserialize(server) :?> (string*int)
+        if result |> fst |> String.IsNullOrWhiteSpace  |> not then
+          hits.Add result
+          if server.CanWrite then sink()
+      sink()
+           }
+
+  let WriteReportBase (hits:ICollection<(string*int)>) report =
+    let counts = Dictionary<string, Dictionary<int, int>>()
+    hits |> Seq.iter(fun (moduleId, hitPointId) ->
+                        AltCover.Base.Counter.AddVisit counts moduleId hitPointId)
+    AltCover.Base.Counter.DoFlush true counts report
+
+  // mocking points
+  let mutable internal GetPayload = PayloadBase
+  let mutable internal GetMonitor = MonitorBase
+  let mutable internal DoReport = WriteReportBase
+
   let DoCoverage arguments =
     let check1 = DeclareOptions ()
                  |> CommandLine.ParseCommandLine arguments
@@ -85,52 +129,21 @@ module Runner =
     match check1 with
     | Left (intro, options) -> HandleBadArguments arguments intro options
     | Right (rest, _) ->
-          use latch = new System.Threading.ManualResetEvent false
-          use latch' = new System.Threading.ManualResetEvent false
+          let instance = RecorderInstance()
+          let token = (GetMethod instance "get_Token") |> GetFirstOperandAsString
+          let report = (GetMethod instance "get_ReportFile") |> GetFirstOperandAsString
 
-          let recorderPath = Path.Combine (Option.get recordingDirectory, "AltCover.Recorder.g.dll")
-          let recorder = Assembly.LoadFrom recorderPath
-          let instanceType = recorder.GetType("AltCover.Recorder.Instance")
-          let token = instanceType.GetProperty("Token", BindingFlags.Public ||| BindingFlags.Static).GetValue(null) :?> string
-          let report = instanceType.GetProperty("ReportFile", BindingFlags.Public ||| BindingFlags.Static).GetValue(null) :?> string
-
-          use server = new System.IO.Pipes.NamedPipeServerStream(token)
-          let formatter = System.Runtime.Serialization.Formatters.Binary.BinaryFormatter()
           let hits = List<(string*int)>()
 
-          let payload = async {
-            CommandLine.doPathOperation (fun () ->
-              CommandLine.ProcessTrailingArguments rest (DirectoryInfo(Option.get workingDirectory)))
-            latch.Set() |> ignore
-          }
-
-          let monitor = async {
-            printfn "Begun monitoring"
-            server.WaitForConnection()
-            printfn "connected"
-            server.WriteByte(0uy)
-            let rec sink () =
-              let result = formatter.Deserialize(server) :?> (string*int)
-              printfn "%A" result
-              if result |> fst |> String.IsNullOrWhiteSpace  |> not then
-                hits.Add result
-                if server.CanWrite then sink()
-            sink()
-            latch.WaitOne() |> ignore
-            printfn "Done monitoring"
-            latch'.Set() |> ignore
-           }
+          let payload = GetPayload rest
+          let monitor = GetMonitor hits token
 
           [monitor; payload]
           |> Async.Parallel
           |> Async.RunSynchronously
           |> ignore
 
-          latch'.WaitOne() |> ignore
-          let counts = Dictionary<string, Dictionary<int, int>>()
-          hits |> Seq.iter(fun (moduleId, hitPointId) ->
-                                AltCover.RecorderProxy.Instance.AddVisit counts moduleId hitPointId)
-          AltCover.RecorderProxy.Instance.DoFlush counts report
+          DoReport hits report
 
   [<EntryPoint>]
   let private Main arguments =
